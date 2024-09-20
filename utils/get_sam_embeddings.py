@@ -63,7 +63,7 @@ try:
         for _ in t:
             # get image information
             image_full_path, img = image_reader.queue.get()
-            image_name = image_full_path[len(image_path):].lstrip("/")
+            image_name = os.path.basename(image_full_path)
 
             t.set_description(f"{image_name}")
             semantic_file_name = f"{image_name}.pt"
