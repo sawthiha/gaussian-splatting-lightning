@@ -317,8 +317,8 @@ def main():
     with torch.no_grad(), tqdm(image_list) as t:
         for image_path in t:
             # build image path
-            image_relative_path = image_path[len(args.image_dir):].lstrip("/")
-            image_relative_path_without_ext = image_relative_path[:image_relative_path.rfind(".")]
+            image_relative_path = os.path.relpath(image_path, args.image_dir)
+            image_relative_path_without_ext = os.path.splitext(image_relative_path)[0]
             t.set_description(image_relative_path)
 
             img = PIL.Image.open(image_path).convert('RGB')
