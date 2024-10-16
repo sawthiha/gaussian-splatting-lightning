@@ -2,6 +2,8 @@ import concurrent.futures
 import json
 import math
 import os.path
+import threading
+import queue
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from rich.progress import track
@@ -27,7 +29,8 @@ class Dataset(torch.utils.data.Dataset):
             image_set: ImageSet,
             undistort_image: bool = True,
             camera_device: torch.device = None,
-            image_device: torch.device = None
+            image_device: torch.device = None,
+            image_uint8: bool = False,
     ) -> None:
         super().__init__()
         self.image_set = image_set
@@ -39,6 +42,7 @@ class Dataset(torch.utils.data.Dataset):
             image_device = torch.device("cpu")
         self.camera_device = camera_device
         self.image_device = image_device
+        self.image_uint8 = image_uint8
 
         self.image_cameras: list[Camera] = [i.to_device(camera_device) for i in image_set.cameras]  # store undistorted camera
 
@@ -51,10 +55,11 @@ class Dataset(torch.utils.data.Dataset):
 
         # TODO: resize
         pil_image = Image.open(self.image_set.image_paths[index])
-        numpy_image = np.array(pil_image, dtype="uint8")
+        numpy_image = np.array(pil_image, dtype=np.uint8)
 
         # undistort image
         if self.undistort_image is True:
+            assert self.image_uint8 == False
             # TODO: validate this undistortion implementation
             camera = self.image_set.cameras[index]  # get original camera
             distortion = camera.distortion_params
@@ -95,13 +100,18 @@ class Dataset(torch.utils.data.Dataset):
                     os.makedirs(os.path.dirname(image_save_path), exist_ok=True)
                     undistorted_pil_image.save(image_save_path, quality=100)
 
-        image = torch.from_numpy(numpy_image.astype(np.float64) / 255.0)
-        # remove alpha channel
-        if image.shape[2] == 4:
-            # TODO: sync background color with model.background_color
-            background_color = torch.tensor([0., 0., 0.])
-            image = image[:, :, :3] * image[:, :, 3:4] + background_color * (1 - image[:, :, 3:4])
-        image = image.to(torch.float)
+        if self.image_uint8:
+            image = torch.from_numpy(numpy_image)
+            assert image.dtype == torch.uint8
+            assert image.shape[2] == 3
+        else:
+            image = torch.from_numpy(numpy_image.astype(np.float64) / 255.0)
+            # remove alpha channel
+            if image.shape[2] == 4:
+                # TODO: sync background color with model.background_color
+                background_color = torch.tensor([0., 0., 0.])
+                image = image[:, :, :3] * image[:, :, 3:4] + background_color * (1 - image[:, :, 3:4])
+            image = image.to(torch.float)
 
         mask = None
         if self.image_set.mask_paths[index] is not None:
@@ -136,6 +146,7 @@ class CacheDataLoader(torch.utils.data.DataLoader):
             distributed: bool = False,
             world_size: int = -1,
             global_rank: int = -1,
+            async_caching: bool = False,
             **kwargs,
     ):
         assert kwargs.get("batch_size", 1) == 1, "only batch_size=1 is supported"
@@ -179,8 +190,35 @@ class CacheDataLoader(torch.utils.data.DataLoader):
             self.generator.manual_seed(seed)
             print("#{} dataloader seed to {}".format(os.getpid(), seed))
 
-    def _cache_data(self, indices: list):
-        # TODO: speedup image loading
+        self.async_caching = async_caching and self.max_cache_num > 0
+        self.cache_output_queue = None
+        self.cache_thread = None
+        self.stop_caching = False
+        if self.async_caching:
+            self.cache_output_queue = queue.Queue(maxsize=1)
+            self.cache_thread = threading.Thread(target=self._async_cache)
+            self.cache_thread.start()
+
+    def _async_cache(self):
+        # TODO: GC will freeze program a while
+        while not self.stop_caching:
+            if self.shuffle is True:
+                indices = torch.randperm(len(self.indices), generator=self.generator).tolist()  # shuffle for each epoch
+                # print("#{} 1st index: {}".format(os.getpid(), indices[0]))
+            else:
+                indices = self.indices.copy()
+
+            not_cached = indices.copy()
+
+            while not_cached and not self.stop_caching:
+                # select self.max_cache_num images
+                to_cache = not_cached[:self.max_cache_num]
+                del not_cached[:self.max_cache_num]
+
+                self.cache_output_queue.put(None)  # simulate a queue with zero size
+                self.cache_output_queue.put(self._cache_data(to_cache, pbar_leave=False))
+
+    def _cache_data(self, indices: list, pbar_leave: bool = True):
         cached = []
         if self.num_workers > 0:
             with ThreadPoolExecutor(max_workers=self.num_workers) as e:
@@ -188,10 +226,11 @@ class CacheDataLoader(torch.utils.data.DataLoader):
                         e.map(self.dataset.__getitem__, indices),
                         total=len(indices),
                         desc="#{} caching images (1st: {})".format(os.getpid(), indices[0]),
+                        leave=pbar_leave,
                 ):
                     cached.append(i)
         else:
-            for i in tqdm(indices, desc="#{} loading images (1st: {})".format(os.getpid(), indices[0])):
+            for i in tqdm(indices, desc="#{} loading images (1st: {})".format(os.getpid(), indices[0]), leave=pbar_leave):
                 cached.append(self.dataset.__getitem__(i))
 
         return cached
@@ -231,20 +270,28 @@ class CacheDataLoader(torch.utils.data.DataLoader):
                 # the list contains the data have not been cached
                 not_cached = indices.copy()
 
-                while not_cached:
-                    # select self.max_cache_num images
-                    to_cache = not_cached[:self.max_cache_num]
-                    del not_cached[:self.max_cache_num]
+                if self.async_caching:
+                    while True:
+                        cached = self.cache_output_queue.get()  # setting to None allows GC
+                        assert cached is None
+                        cached = self.cache_output_queue.get()
+                        for i in cached:
+                            yield i
+                else:
+                    while not_cached:
+                        # select self.max_cache_num images
+                        to_cache = not_cached[:self.max_cache_num]
+                        del not_cached[:self.max_cache_num]
 
-                    # cache
-                    try:
-                        del cached
-                    except:
-                        pass
-                    cached = self._cache_data(to_cache)
+                        # cache
+                        try:
+                            del cached
+                        except:
+                            pass
+                        cached = self._cache_data(to_cache, pbar_leave=False)
 
-                    for i in cached:
-                        yield i
+                        for i in cached:
+                            yield i
 
 
 class DataModule(LightningDataModule):
@@ -268,6 +315,8 @@ class DataModule(LightningDataModule):
             background_sphere_min_altitude: float = -math.inf,
             camera_on_cpu: bool = False,
             image_on_cpu: bool = True,
+            image_uint8: bool = False,
+            async_caching: bool = False,
     ) -> None:
         r"""Load dataset
 
@@ -435,6 +484,7 @@ class DataModule(LightningDataModule):
                 undistort_image=self.hparams["undistort_image"],
                 camera_device=self.camera_device,
                 image_device=self.image_device,
+                image_uint8=self.hparams["image_uint8"],
             ),
             max_cache_num=self.hparams["train_max_num_images_to_cache"],
             shuffle=True,
@@ -443,6 +493,7 @@ class DataModule(LightningDataModule):
             distributed=self.hparams["distributed"],
             world_size=self.trainer.world_size,
             global_rank=self.trainer.global_rank,
+            async_caching=self.hparams["async_caching"],
         )
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
@@ -478,3 +529,14 @@ class DataModule(LightningDataModule):
             shuffle=False,
             num_workers=self.hparams["num_workers"],
         )
+
+    def on_after_batch_transfer(self, batch: Any, dataloader_idx: int) -> Any:
+        if batch[1][1].dtype != torch.uint8:
+            return batch
+
+        camera, image_info, extra_data = batch
+        image_name, gt_image, masked_pixels = image_info
+
+        gt_image = gt_image.to(camera.R.dtype) / 255.
+
+        return camera, (image_name, gt_image, masked_pixels), extra_data
