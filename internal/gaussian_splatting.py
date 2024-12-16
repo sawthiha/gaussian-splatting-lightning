@@ -94,6 +94,7 @@ class GaussianSplatting(LightningModule):
         self.val_metrics: List[Tuple[str, Dict]] = []
 
         # hooks
+        self.on_train_start_hooks: List[Callable[[GaussianModel, Self], None]] = []
         self.on_after_backward_hooks: List[Callable[[Dict, Any, GaussianModel, int, Self], None]] = []
         self.on_train_batch_end_hooks: List[Callable[[Dict, Any, GaussianModel, int, Self], None]] = []
 
@@ -311,6 +312,9 @@ class GaussianSplatting(LightningModule):
             )
             self.web_viewer.start()
 
+        for i in self.on_train_start_hooks:
+            i(self.gaussian_model, self)
+
     def on_train_batch_start(self, batch: Any, batch_idx: int):
         if self.web_viewer is not None:
             self.web_viewer.training_step(
@@ -440,7 +444,7 @@ class GaussianSplatting(LightningModule):
 
             from internal.density_controllers.density_controller import Utils
             valid_points_mask = ~prune_mask  # `True` to keep
-            self.gaussian_model.properties = Utils.prune_optimizers(valid_points_mask, self.gaussian_optimizers)
+            self.gaussian_model.properties = Utils.prune_properties(valid_points_mask, self.gaussian_model, self.gaussian_optimizers)
             self.density_updated_by_renderer()
 
             print(f"number_of_gaussian_after_pruning={self.gaussian_model.get_xyz.shape[0]}")

@@ -11,6 +11,7 @@
 * Multiple dataset types support
   * <a href="https://drive.google.com/drive/folders/1JDdLGDruGNXWnM1eqY1FNL9PlStjaKWi">Blender (nerf_synthetic)</a>
   * Colmap
+  * PolyCam (<a href="https://github.com/yzslab/gaussian-splatting-lightning/tree/main/utils/PolyCam.md">See the instruction here</a>)
   * <a href="https://github.com/google/nerfies?tab=readme-ov-file#datasets">Nerfies</a>
   * <a href="https://github.com/facebookresearch/NSVF?tab=readme-ov-file#dataset">NSVF (Synthetic only)</a>
   * <a href="https://city-super.github.io/matrixcity/">MatrixCity</a> (<a href="https://github.com/yzslab/gaussian-splatting-lightning/tree/main/configs/matrixcity/README.md">Prepare your dataset</a>)
@@ -40,6 +41,9 @@
   * <a href="#216-new-multiple-gpu-training-strategy">New Multiple GPU training strategy (2.16.)</a>
   * <a href="#217-spotlesssplats">SpotLessSplats (2.17.)</a>
   * <a href="#218-depth-regularization-with-depth-anything-v2">Depth Regularization with Depth Anything V2 (2.18.)</a>
+  * <a href="#219-stopthepop">StopThePop (2.19.)</a>
+  * <a href="#220-scale-regularization">Scale Regularization (2.20.)</a>
+  * <a href="#221-taming-3dgs">Taming 3DGS (2.21.)</a>
 ## 1. Installation
 ### 1.1. Clone repository
 
@@ -75,12 +79,12 @@ pip install -r requirements.txt
 ### 1.5. Install optional packages
 * <a href="https://ffmpeg.org/">ffmpeg</a> is required if you want to render video: `sudo apt install -y ffmpeg`
 * If you want to use <a href="https://github.com/nerfstudio-project/gsplat">nerfstudio-project/gsplat</a>
+
+  NOTE: Only my modified v1 is supported
   
-    ```bash
-    pip install git+https://github.com/yzslab/gsplat.git
-    ```
-  
-  This command will install my modified version, which is required by LightGaussian and Mip-Splatting. If you do not need them, you can also install vanilla gsplat <a href="https://github.com/nerfstudio-project/gsplat/tree/v0.1.12">v0.1.12</a>.
+  ```bash
+  pip install git+https://github.com/yzslab/gsplat.git@f5368ccac83af6b30a3ebd9d38c9302576cb5f99
+  ```
   
 * If you need <a href="#210-segment-any-3d-gaussians">SegAnyGaussian</a>
   * gsplat (see command above)
@@ -150,11 +154,48 @@ You can use `utils/image_downsample.py` to downsample your images, e.g. 4x downs
 Rounding mode is specified by `--data.parser.down_sample_rounding_mode`. Available values are `floor`, `round`, `round_half_up`, `ceil`. Default is `round`.
 
 * Load large dataset without OOM
-```bash
-... fit \
-  --data.train_max_num_images_to_cache 1024 \
-  ...
-```
+  * [1st option] Cache images in uint8 data type
+    ```bash
+    ... fit \
+        --data.image_uint8 true
+    ```
+  * [2nd option] Limit the maximum number of the cached images
+    * Cache the next batch during training (Recommended)
+      ```bash
+      ... fit \
+        --data.train_max_num_images_to_cache 512 \
+        --data.async_caching true \
+        ...
+      ```
+    * Cache the next batch at the end of the current batch
+      ```bash
+      ... fit \
+        --data.train_max_num_images_to_cache 1024 \
+        ...
+      ```
+
+* Speedup training
+  * Store all images in GPU memory
+
+    ```bash
+    ... fit \
+      --data.image_on_cpu false \
+      ...
+    ```
+
+    Combining this with `--data.image_uint8 true` to reduce GPU memory consumption is also feasible.
+
+  * Avoid performing a validation after every training epoch
+
+    Simply set `check_val_every_n_epoch` to a very large value. Please note that the metrics starting with `val/`, such as `val/psnr`, on the progress bar will not be updated during the training.
+
+    ```bash
+    ... fit \
+      --trainer.check_val_every_n_epoch 99999 \
+      ...
+    ```
+
+  * Take a look at <a href="#221-taming-3dgs">Taming 3DGS (2.21.)</a> for further acceleration
 
 ### 2.3. Use <a href="https://github.com/nerfstudio-project/gsplat">nerfstudio-project/gsplat</a>
 Make sure that command `which nvcc` can produce output, or gsplat will be disabled automatically.
@@ -199,10 +240,17 @@ python main.py fit \
 ```
 
 ### 2.6. <a href="https://niujinshuchong.github.io/mip-splatting/">Mip-Splatting</a>
+Training:
 ```bash
 python main.py fit \
-    --config configs/mip_splatting_gsplat.yaml \
+    --config configs/mip_splatting_gsplat_v2.yaml \
     --data.path ...
+```
+
+Fuse the 3D smoothing filter to the Gaussian parameters:
+```bash
+python utils/fuse_mip_filter.py \
+    TRAINED_MODEL_DIR
 ```
 
 ### 2.7. <a href="https://lightgaussian.github.io/">LightGaussian</a>
@@ -235,7 +283,7 @@ python main.py fit \
 ### 2.9. <a href="https://surfsplatting.github.io/">2D Gaussian Splatting</a>
 * Install `diff-surfel-rasterization` first
   ```bash
-  pip install git+https://github.com/hbb1/diff-surfel-rasterization.git@3a9357f6a4b80ba319560be7965ed6a88ec951c6
+  pip install git+https://github.com/hbb1/diff-surfel-rasterization.git@e0ed0207b3e0669960cfad70852200a4a5847f61
   ```
 
 * Then start training
@@ -244,6 +292,23 @@ python main.py fit \
       --config configs/vanilla_2dgs.yaml \
       --data.path ...
   ```
+
+* Mesh extraction
+
+  Install required libraries first:
+  ```bash
+  pip install open3d==0.18.0 scikit-image==0.24.0 trimesh==4.4.3
+  ```
+
+  * Bounded
+    ```bash
+    python utils/gs2d_mesh_extraction.py MODEL_OUTPUT_PATH
+    ```
+
+  * Unbounded
+    ```bash
+    python utils/gs2d_mesh_extraction.py MODEL_OUTPUT_PATH --unbounded true
+    ```
   
 ### 2.10. <a href="https://jumpat.github.io/SAGA/">Segment Any 3D Gaussians</a>
 * First, train a 3DGS scene using gsplat
@@ -548,13 +613,6 @@ Please refer to <a href="https://github.com/yzslab/gaussian-splatting-lightning/
   By running `python utils/fuse_appearance_embeddings_into_shs_dc.py TRAINED_MODEL_DIR`, you can get a fixed appearance checkpoint without requiring a MLP.
   
 ### 2.13. <a href="https://ubc-vision.github.io/3dgs-mcmc/">3DGS-MCMC</a>
-* Install `submodules/mcmc_relocation` first
-
-```bash
-pip install submodules/mcmc_relocation
-```
-
-* Then training
 
 ```bash
 ... fit \
@@ -832,6 +890,61 @@ This is implemented with reference to <a href="https://repo-sam.inria.fr/fungrap
     
     In my experiments, simply L1 is slightly better than L2 or the one with SSIM.
 
+### 2.19. <a href="https://r4dl.github.io/StopThePop/">StopThePop</a>
+* Install the StopThePop-Rasterization first:
+  ```bash
+  pip install dacite git+https://github.com/yzslab/StopThePop-Rasterization.git
+  ```
+
+* Training:
+  ```bash
+  python main.py fit \
+      --config configs/stp/baseline.yaml \
+      --data.path ... \
+      ...
+  ```
+
+### 2.20. Scale Regularization
+The scales of Gaussians will grow to some unreasonable values after densification. For example, some linear shape Gaussians are almost longer than your scene, and appear as artifacts at many viewpoints. This regularization, containing max scale and scale ratio losses, can avoid it. Take a look <a href="https://github.com/yzslab/gaussian-splatting-lightning/blob/main/internal/metrics/scale_regularization_metrics.py">internal/metrics/scale_regularization_metrics.py</a> for more details.
+
+Usage: 
+```bash
+python main.py fit \
+    --config configs/scale_reg.yaml \
+    --model.metric.max_scale 1. \
+    ...
+```
+
+The `--model.metric.max_scale` is a scene-specific hyperparameter. The regularization will be applied to the Gaussians with scales exceeding it. It should be greater than `percent_dense * camera_extent`. The `percent_dense` is `0.01` by default. The `camera_extent` will be printed as `spatial_lr_scale=...` at the beginning of the training. Set it to a very large value, e.g. `2048`, to disable the max scale loss if you are not sure what value should be used.
+
+
+### 2.21. <a href="https://humansensinglab.github.io/taming-3dgs/">Taming 3DGS</a>
+There are two implementations: one is the gsplat v1 based, and the other is the vanilla one. The gsplat v1 based implementation currently does not have "Backpropagation with Per-Splat Parallelization."
+
+* (a) Install libraries first
+  * fused-ssim
+    ```bash
+    pip install git+https://github.com/rahul-goel/fused-ssim.git@d99e3d27513fa3563d98f74fcd40fd429e9e9b0e
+    ```
+
+  * my modified gsplat v1 if you want the gsplat v1 based one (refer to <a href="#15-install-optional-packages">1.5.</a> for the setup guide)
+
+  * another rasterizer if you want the vanilla one
+    ```bash
+    pip install git+https://github.com/yzslab/diff-gaussian-rasterization.git@b403ab6c5cfb4ed89265a9759bd4766f9c4b56de
+    ```
+
+* (b) Available config files
+
+  | Type | gsplat v1 | vanilla |
+  | --- | --- | --- |
+  | Competitive quality | `configs/gsplat_v1-accel.yaml` | `configs/taming_3dgs/rasterizer-fused_ssim-aa.yaml` |
+  | More acceleration, slightly lower quality (SparseAdam) | `configs/gsplat_v1-accel_more.yaml` | `configs/taming_3dgs/rasterizer-fused_ssim-sparse_adam-aa.yaml` |
+  | Steerable Densification | `configs/gsplat_v1-accel-steerable.yaml` | - |
+
+  You need to adjust the `--model.density.budget` if you want to use the steerable one.
+
+
 ## 3. Evaluation
 
 Per-image metrics will be saved to `TRAINING_OUTPUT/metrics` as a `csv` file.
@@ -909,7 +1022,7 @@ python viewer.py \
 * <a href="https://github.com/hbb1/2d-gaussian-splatting">hbb1/2d-gaussian-splatting</a>
 ```bash
 # Install `diff-surfel-rasterization` first
-pip install git+https://github.com/hbb1/diff-surfel-rasterization.git@28c928a36ea19407cd9754d068bd9a9535216979
+pip install git+https://github.com/hbb1/diff-surfel-rasterization.git@e0ed0207b3e0669960cfad70852200a4a5847f61
 # Then start viewer
 python viewer.py \
     2d-gaussian-splatting/outputs/Truck \

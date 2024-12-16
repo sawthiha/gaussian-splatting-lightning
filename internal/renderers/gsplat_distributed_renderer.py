@@ -1,10 +1,12 @@
 import traceback
-from gsplat import project_gaussians
-from gsplat.rasterize import rasterize_gaussians
-from gsplat.sh import spherical_harmonics
-from .renderer import *
+from typing import Optional, Union, List, Tuple, Dict
+from dataclasses import dataclass
+from .renderer import Renderer, RendererConfig, RendererOutputInfo, RendererOutputTypes
+from gsplat.cuda._wrapper import fully_fused_projection
+from .gsplat_v1_renderer import GSplatV1, spherical_harmonics_decomposed
 from lightning.pytorch.profilers import PassThroughProfiler
 from internal.density_controllers.density_controller import Utils as DensityControllerUtils
+import lightning
 import torch.distributed.nn.functional
 
 DEFAULT_BLOCK_SIZE: int = 16
@@ -16,6 +18,10 @@ class GSplatDistributedRenderer(RendererConfig):
     block_size: int = DEFAULT_BLOCK_SIZE
 
     anti_aliased: bool = DEFAULT_ANTI_ALIASED_STATUS
+
+    filter_2d_kernel_size: float = 0.3
+
+    tile_based_culling: bool = False
 
     # Since the density controllers are replaceable, below parameters should be updated manually when the parameters of density controller changed
 
@@ -43,6 +49,10 @@ class GSplatDistributedRendererImpl(Renderer):
 
         self.block_size = config.block_size
         self.anti_aliased = config.anti_aliased
+
+        self.isect_encode = GSplatV1.isect_encode_with_unused_opacities
+        if self.config.tile_based_culling:
+            self.isect_encode = GSplatV1.isect_encode_tile_based_culling
 
         self.world_size = 1
         self.global_rank = 0
@@ -95,6 +105,16 @@ class GSplatDistributedRendererImpl(Renderer):
 
         self.get_trainer = get_trainer
 
+        self.project_gaussians = self.batch_project
+        # Check whether all images have consistent shapes
+        train_set_cameras = module.trainer.datamodule.dataparser_outputs.train_set.cameras
+        val_set_cameras = module.trainer.datamodule.dataparser_outputs.val_set.cameras
+        for i in [train_set_cameras, val_set_cameras]:
+            if i.width.unique().shape[0] + i.height.unique().shape[0] != 2:
+                print("Disable batching projection")
+                self.project_gaussians = self.non_batch_project
+                break
+
         return None, None
 
     @staticmethod
@@ -111,12 +131,17 @@ class GSplatDistributedRendererImpl(Renderer):
             opacities: torch.Tensor,
             device,
     ) -> Tuple[List, torch.Tensor, torch.Tensor, List]:
+        visibility_filter_list = []
+        n_visible_gaussian_list = []
+        for i in projection_result_list:
+            visibility_filter_list.append(i[-1])
+            n_visible_gaussian_list.append(i[-1].sum().to(torch.int))
+
         # gather numbers of visible Gaussian
-        visible_mask_list = [(i[2] > 0) for i in projection_result_list]
         gathered_n_visible = [torch.tensor(-1, dtype=torch.int, device=device) for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_to_all(
             gathered_n_visible,
-            input_tensor_list=[i.sum().to(torch.int) for i in visible_mask_list],
+            input_tensor_list=n_visible_gaussian_list,
         )
 
         output_float_tensor_list = []
@@ -125,37 +150,31 @@ class GSplatDistributedRendererImpl(Renderer):
         input_int_tensor_list = []
 
         for i in range(len(projection_result_list)):
-            xys, depths, radii, conics, comp, num_tiles_hit, cov3d = projection_result_list[i]
+            radii, means2d, depths, conics, compensations, visibility_filter = projection_result_list[i]
             """
-            xys: [N, 2]
-            depths: [N], int
             radii: [N], int
-            conics: [N, 3]
-            comp: [N]
-            num_tile_hit: [N], int
-            cov3d: [N, 6]
+            means2d: [N, 2], float
+            depths: [N], float
+            conics: [N, 3], float
+            compensations: [N], float
+            visibility_filter: [N], bool
             
             opacities: [N, 1]
             rgb: [N, 3]
             """
 
-            visible_mask = visible_mask_list[i]
-
             # build float tensor sent to other members
             float_tensor = torch.concat([
-                xys,
+                means2d,
                 depths.unsqueeze(-1),
                 conics,
-                comp.unsqueeze(-1),
+                compensations.unsqueeze(-1),
                 # cov3d,  # this is not required by rasterization
                 opacities,
                 rgb_list[i],
-            ], dim=-1)[visible_mask]
+            ], dim=-1)[visibility_filter]
             # build int tensor
-            int_tensor = torch.concat([
-                radii.unsqueeze(-1),
-                num_tiles_hit.unsqueeze(-1),
-            ], dim=-1)[visible_mask]
+            int_tensor = radii[visibility_filter]
             # append to input list
             input_float_tensor_list.append(float_tensor)
             input_int_tensor_list.append(int_tensor)
@@ -167,7 +186,7 @@ class GSplatDistributedRendererImpl(Renderer):
                 device=device,
             ))
             output_int_tensor_list.append(torch.empty(
-                (gathered_n_visible[i], int_tensor.shape[-1]),
+                (gathered_n_visible[i],),
                 dtype=torch.int,
                 device=device,
             ))
@@ -186,41 +205,114 @@ class GSplatDistributedRendererImpl(Renderer):
         float_tensor = torch.concat(output_float_tensor_list, dim=0)
         int_tensor = torch.concat(output_int_tensor_list, dim=0)
 
-        xys, depths, conics, comp, opacities, rgbs = torch.split(
+        means2d, depths, conics, compensations, opacities, rgbs = torch.split(
             float_tensor,
             [2, 1, 3, 1, 1, 3],
             dim=-1,
         )
-        radii, num_tiles_hit = torch.split(
-            int_tensor,
-            [1, 1],
-            dim=-1,
-        )
+        radii = int_tensor
 
         return [
-            xys, depths.squeeze(-1), radii.squeeze(-1), conics, comp.squeeze(-1), num_tiles_hit.squeeze(-1),
-        ], opacities, rgbs, visible_mask_list
+            radii, means2d, depths.squeeze(-1), conics, compensations,
+        ], opacities, rgbs, visibility_filter_list
 
-    def project(self, camera: Camera, pc: GaussianModel, scaling_modifier):
-        results = project_gaussians(
-            means3d=pc.get_xyz,
-            scales=pc.get_scaling,
-            glob_scale=scaling_modifier,
-            quats=pc.get_rotation,
-            viewmat=camera.world_to_camera.T,
-            # projmat=viewpoint_camera.full_projection.T,
-            fx=camera.fx.item(),
-            fy=camera.fy.item(),
-            cx=camera.cx.item(),
-            cy=camera.cy.item(),
-            img_height=camera.height.item(),
-            img_width=camera.width.item(),
-            block_width=self.block_size,
+    def get_scales_and_opacities(self, pc):
+        return pc.get_scales(), pc.get_opacities()
+
+    def project(self, camera, pc, scales, scaling_modifier):
+        preprocessed_camera = GSplatV1.preprocess_camera(camera)
+
+        if scaling_modifier != 1.:
+            scales = scales * scaling_modifier
+
+        radii, means2d, depths, conics, compensations = GSplatV1.project(
+            preprocessed_camera,
+            means3d=pc.get_means(),
+            scales=scales,
+            quats=pc.get_rotations(),
+            eps2d=self.config.filter_2d_kernel_size,
+            anti_aliased=True,
         )
 
-        return results
+        return radii[0], means2d[0], depths[0], conics[0], compensations[0], radii[0] > 0
 
-    def forward(self, viewpoint_camera: Camera, pc: GaussianModel, bg_color: torch.Tensor, scaling_modifier=1.0, render_types: list = None, **kwargs):
+    def non_batch_project(self, cameras, pc, scales, scaling_modifier):
+        # perform the projection and SH for each member's camera
+        projection_results_list = []
+        rgb_list = []
+        for camera in cameras:
+            # store projection results to list
+            project_results = self.project(camera, pc, scales, scaling_modifier)
+            projection_results_list.append(project_results)
+
+            rgb_list.append(self.get_rgbs(pc, camera, project_results))
+
+        return projection_results_list, rgb_list
+
+    def batch_project(self, cameras, pc, scales, scaling_modifier):
+        viewmats = []
+        Ks = []
+        camera_centers = []
+
+        for camera in cameras:
+            viewmats.append(camera.world_to_camera.T)
+            Ks.append(GSplatV1.get_intrinsics_matrix(
+                fx=camera.fx,
+                fy=camera.fy,
+                cx=camera.cx,
+                cy=camera.cy,
+                device=scales.device,
+            ))
+            camera_centers.append(camera.camera_center)
+
+        if scaling_modifier != 1.:
+            scales = scales * scaling_modifier
+
+        radii, means2d, depths, conics, compensations = fully_fused_projection(
+            pc.get_means(),
+            None,
+            pc.get_rotations(),
+            scales,
+            viewmats=torch.stack(viewmats),
+            Ks=torch.stack(Ks),
+            width=cameras[0].width.item(),
+            height=cameras[0].height.item(),
+            eps2d=self.config.filter_2d_kernel_size,
+            calc_compensations=True,
+            packed=False,
+        )
+        visibility_filter = radii > 0
+
+        # viewdirs = pc.get_means().detach()[None, :, :] - torch.stack(camera_centers)[:, None, :]  # [1, N, 3] - [C, 1, 3] -> [C, N, 3]
+        # rgbs = spherical_harmonics_decomposed(
+        #     pc.active_sh_degree,
+        #     viewdirs,
+        #     dc=pc.get_shs_dc().expand(viewdirs.shape[0], -1, -1, -1),
+        #     coeffs=pc.get_shs_rest().expand(viewdirs.shape[0], -1, -1, -1),
+        #     masks=visibility_filter,
+        # )
+        # rgbs = torch.clamp(rgbs + 0.5, min=0.0)
+
+        projection_results_list = []
+        rgb_list = []
+        for idx in range(len(cameras)):
+            project_results = (
+                radii[idx],
+                means2d[idx],
+                depths[idx],
+                conics[idx],
+                compensations[idx],
+                visibility_filter[idx],
+            )
+            projection_results_list.append(project_results)
+            # TODO: camera batching
+            rgb_list.append(self.get_rgbs(pc, cameras[idx], project_results))
+
+        return projection_results_list, rgb_list
+
+    def forward(self, viewpoint_camera, pc, bg_color: torch.Tensor, scaling_modifier=1.0, render_types: list = None, **kwargs):
+        if render_types is None:
+            render_types = ["rgb"]
         with self.profiler.profile(f"{self.profile_prefix}forward"):
             with self.profiler.profile(f"{self.profile_prefix}gather_cameras"):
                 # gather camera ids
@@ -242,67 +334,89 @@ class GSplatDistributedRendererImpl(Renderer):
                         camera.to_device(viewpoint_camera.device)
                     gathered_cameras.append(camera)
 
+            scales, opacities = self.get_scales_and_opacities(pc)
             with self.profiler.profile(f"{self.profile_prefix}project"):
                 # perform the projection and SH for each member's camera
-                projection_results_list = []
-                rgb_list = []
-                for camera in gathered_cameras:
-                    # store projection results to list
-                    project_results = self.project(camera, pc, scaling_modifier)
-                    projection_results_list.append(project_results)
-
-                    rgb_list.append(self.get_rgbs(pc, camera, project_results))
+                projection_results_list, rgb_list = self.project_gaussians(
+                    gathered_cameras,
+                    pc,
+                    scales,
+                    scaling_modifier,
+                )
 
             with self.profiler.profile(f"{self.profile_prefix}rasterizer_required_data_all2all"):
                 # perform All-to-All operation
                 projection_results, opacities, rgbs, visible_mask_list = self.rasterizer_required_data_all2all(
                     projection_result_list=projection_results_list,
                     rgb_list=rgb_list,
-                    opacities=pc.get_opacity,
+                    opacities=opacities,
                     device=bg_color.device,
                 )
 
             # rasterization below is the same as non-distributed renderer
 
-            xys, depths, radii, conics, comp, num_tiles_hit = projection_results
+            radii, means2d, depths, conics, compensations = projection_results
+            projection_results = radii.unsqueeze(0), means2d.unsqueeze(0), depths.unsqueeze(0), conics.unsqueeze(0), None
 
             if self.anti_aliased is True:
-                opacities = opacities * comp[:, None]
+                opacities = opacities * compensations
+
+            opacities = opacities.squeeze(-1).unsqueeze(0)
 
             local_camera_data = gathered_cameras[self.global_rank]
             img_height = local_camera_data.height
             img_width = local_camera_data.width
 
+            preprocessed_local_camera = None, None, (img_width, img_height)
+
+            isects = self.isect_encode(
+                preprocessed_local_camera,
+                projection_results,
+                opacities=opacities,
+                tile_size=self.block_size,
+            )
+
             with self.profiler.profile(f"{self.profile_prefix}rasterize"):
-                rgb = rasterize_gaussians(  # type: ignore
-                    xys,
-                    depths,
-                    radii,
-                    conics,
-                    num_tiles_hit,  # type: ignore
-                    rgbs,
+                rgb, _ = GSplatV1.rasterize(
+                    preprocessed_local_camera,
+                    projection_results,
+                    isects,
                     opacities,
-                    img_height=img_height,
-                    img_width=img_width,
-                    block_width=self.block_size,
+                    colors=rgbs,
                     background=bg_color,
-                    return_alpha=False,
-                )  # type: ignore
+                    tile_size=self.config.block_size,
+                )
                 rgb = rgb.permute(2, 0, 1)
+
+                # hard inverse depth
+                hard_inverse_depth_im = None
+                if "hard_inverse_depth" in render_types:
+                    inverse_depth = 1. / (depths.clamp_min(0.) + 1e-8).unsqueeze(-1)
+                    hard_inverse_depth_im, _ = GSplatV1.rasterize(
+                        preprocessed_local_camera,
+                        projection_results,
+                        isects,
+                        opacities + (1 - opacities.detach()),
+                        colors=inverse_depth,
+                        background=torch.zeros((1,), dtype=torch.float, device=bg_color.device),
+                        tile_size=self.config.block_size,
+                    )
+                    hard_inverse_depth_im = hard_inverse_depth_im.permute(2, 0, 1)
 
         # a little difference below, since the densification needs projection results from all cameras
         return {
             "render": rgb,
+            "hard_inverse_depth": hard_inverse_depth_im,
             "cameras": gathered_cameras,
             "projection_results_list": projection_results_list,
             "visible_mask_list": visible_mask_list,
             "xys_grad_scale_required": True,
         }
 
-    def get_rgbs(self, pc, camera: Camera, project_results) -> torch.Tensor:
+    def get_rgbs(self, pc, camera, project_results) -> torch.Tensor:
         # store SH results to list
         viewdirs = pc.get_xyz.detach() - camera.camera_center  # (N, 3)
-        rgbs = spherical_harmonics(pc.active_sh_degree, viewdirs, pc.get_features)
+        rgbs = spherical_harmonics_decomposed(pc.active_sh_degree, viewdirs, pc.get_shs_dc(), pc.get_shs_rest(), project_results[-1])
         rgbs = torch.clamp(rgbs + 0.5, min=0.0)  # type: ignore
         return rgbs
 
@@ -367,7 +481,8 @@ class GSplatDistributedRendererImpl(Renderer):
         def invoke_all2all(local_tensor):
             return self.all2all_gaussian_state(local_tensor, destination=destination, number_of_gaussians_to_receive=number_of_gaussians_to_receive)
 
-        optimizable_tensors = {}
+        new_tensors = {}
+        # optimizable
         for opt in optimizers:
             for group in opt.param_groups:
                 assert len(group["params"]) == 1
@@ -383,12 +498,19 @@ class GSplatDistributedRendererImpl(Renderer):
                 else:
                     group["params"][0] = torch.nn.Parameter(invoke_all2all(group["params"][0]).requires_grad_(True))
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                new_tensors[group["name"]] = group["params"][0]
+
+        # tensors
+        for name in gaussian_model.get_property_names():
+            if name in new_tensors:
+                continue
+            new_tensors[name] = invoke_all2all(gaussian_model.get_property(name))
 
         # update
-        gaussian_model.properties = optimizable_tensors
+        gaussian_model.properties = new_tensors
 
     def get_available_outputs(self) -> Dict:
         return {
             "rgb": RendererOutputInfo("render"),
+            "hard_inverse_depth": RendererOutputInfo("hard_inverse_depth", type=RendererOutputTypes.GRAY),
         }

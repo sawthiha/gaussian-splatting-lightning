@@ -14,7 +14,7 @@ parser.add_argument("image_dir")
 parser.add_argument("--input_size", "-s", type=int, default=518)
 parser.add_argument("--output", "-o", default=None)
 parser.add_argument("--encoder", default="vitl")
-parser.add_argument("--extensions", "-e", default=["jpg", "JPG", "jpeg", "JPEG"])
+parser.add_argument("--extensions", "-e", default=["jpg", "JPG", "jpeg", "JPEG", "png", "PNG"])
 parser.add_argument("--preview", "-p", action="store_true", default=False)
 parser.add_argument("--colormap", type=str, default="default")
 parser.add_argument("--da2_path", type=str, default=os.path.join(os.path.dirname(__file__), "Depth-Anything-V2"))
@@ -28,6 +28,7 @@ if args.output is None:
     args.output = os.path.join(os.path.dirname(args.image_dir), "estimated_depths")
 
 images = get_task_list_with_args(args, find_files(args.image_dir, args.extensions, as_relative_path=False))
+assert len(images) > 0, "not an image with extension name '{}' can be found in '{}'".format(args.extensions, args.image_dir)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 

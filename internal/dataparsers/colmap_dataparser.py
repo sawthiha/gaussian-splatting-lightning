@@ -58,9 +58,13 @@ class Colmap(DataParserConfig):
 
     down_sample_rounding_mode: Literal["floor", "round", "round_half_up", "ceil"] = "round"
 
-    points_from: Literal["sfm", "random"] = "sfm"
+    points_from: Literal["sfm", "random", "ply"] = "sfm"
+
+    ply_file: str = None
 
     n_random_points: int = 100_000
+
+    force_pinhole: bool = False
 
     def instantiate(self, path: str, output_path: str, global_rank: int) -> DataParser:
         return ColmapDataParser(path, output_path, global_rank, self)
@@ -298,7 +302,7 @@ class ColmapDataParser(DataParser):
                 cy = intrinsics.params[2]
                 # fov_y = focal2fov(focal_length_x, height)
                 # fov_x = focal2fov(focal_length_x, width)
-            elif intrinsics.model == "PINHOLE":
+            elif intrinsics.model == "PINHOLE" or self.params.force_pinhole is True:
                 focal_length_x = intrinsics.params[0]
                 focal_length_y = intrinsics.params[1]
                 cx = intrinsics.params[2]
@@ -461,6 +465,13 @@ class ColmapDataParser(DataParser):
             scene_radius = (image_set[0].cameras.camera_center - scene_center).norm(dim=-1).max()
             xyz = (np.random.random((self.params.n_random_points, 3)) * 2. - 1.) * 3 * scene_radius.numpy() + scene_center.numpy()
             rgb = (np.random.random((self.params.n_random_points, 3)) * 255).astype(np.uint8)
+        elif self.params.points_from == "ply":
+            assert self.params.ply_file is not None
+            from internal.utils.graphics_utils import fetch_ply_without_rgb_normalization
+            basic_pcd = fetch_ply_without_rgb_normalization(os.path.join(self.path, self.params.ply_file))
+            xyz = basic_pcd.points
+            rgb = basic_pcd.colors
+            print("load {} points from {}".format(xyz.shape[0], self.params.ply_file))
 
         # print information
         print("[colmap dataparser] train set images: {}, val set images: {}, loaded mask: {}".format(

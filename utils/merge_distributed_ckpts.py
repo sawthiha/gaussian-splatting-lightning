@@ -115,13 +115,31 @@ else:
         ckpt["optimizer_states"][0]["state"][i]["exp_avg"] = torch.concat(optimizer_state_exp_avg_list_key_by_index[i], dim=0)
         ckpt["optimizer_states"][0]["state"][i]["exp_avg_sq"] = torch.concat(optimizer_state_exp_avg_sq_list_key_by_index[i], dim=0)
 
+
+def rename_ddp_appearance_states():
+    gaussian_property_dict_key_prefix = "renderer.appearance_model.module."
+    for i in list(ckpt["state_dict"].keys()):
+        if i.startswith(gaussian_property_dict_key_prefix) is False:
+            continue
+        new_key = "renderer.model.{}".format(i[len(gaussian_property_dict_key_prefix):])
+        ckpt["state_dict"][new_key] = ckpt["state_dict"][i]
+        del ckpt["state_dict"][i]
+
+
 # replace renderer to non-distributed one
 if ckpt["hyper_parameters"]["renderer"].__class__.__name__ == "GSplatDistributedRenderer":
     print("Replace renderer with `GSPlatRenderer`")
 
-    import internal.renderers.gsplat_renderer
+    import internal.renderers.gsplat_v1_renderer
 
-    ckpt["hyper_parameters"]["renderer"] = internal.renderers.gsplat_renderer.GSPlatRenderer()
+    ckpt["hyper_parameters"]["renderer"] = internal.renderers.gsplat_v1_renderer.GSplatV1Renderer(
+        block_size=getattr(ckpt["hyper_parameters"]["renderer"], "block_size", 16),
+        anti_aliased=getattr(ckpt["hyper_parameters"]["renderer"], "anti_aliased", True),
+        filter_2d_kernel_size=getattr(ckpt["hyper_parameters"]["renderer"], "filter_2d_kernel_size", 0.3),
+        separate_sh=getattr(ckpt["hyper_parameters"]["renderer"], "separate_sh", False),
+        tile_based_culling=getattr(ckpt["hyper_parameters"]["renderer"], "tile_based_culling", False),
+    )
+    print(ckpt["hyper_parameters"]["renderer"])
 elif ckpt["hyper_parameters"]["renderer"].__class__.__name__ == "GSplatDistributedAppearanceEmbeddingRenderer":
     print("Replace renderer with `GSplatAppearanceEmbeddingRenderer`")
 
@@ -130,17 +148,27 @@ elif ckpt["hyper_parameters"]["renderer"].__class__.__name__ == "GSplatDistribut
     renderer = GSplatAppearanceEmbeddingRenderer(
         model=ckpt["hyper_parameters"]["renderer"].appearance,
         optimization=ckpt["hyper_parameters"]["renderer"].appearance_optimization,
+        filter_2d_kernel_size=getattr(ckpt["hyper_parameters"]["renderer"], "filter_2d_kernel_size", 0.3),
+        tile_based_culling=getattr(ckpt["hyper_parameters"]["renderer"], "tile_based_culling", False),
     )
-    renderer.setup("validation", None)
     ckpt["hyper_parameters"]["renderer"] = renderer
 
-    gaussian_property_dict_key_prefix = "renderer.appearance_model.module."
-    for i in list(ckpt["state_dict"].keys()):
-        if i.startswith(gaussian_property_dict_key_prefix) is False:
-            continue
-        new_key = "renderer.model.{}".format(i[len(gaussian_property_dict_key_prefix):])
-        ckpt["state_dict"][new_key] = ckpt["state_dict"][i]
-        del ckpt["state_dict"][i]
+    rename_ddp_appearance_states()
+elif ckpt["hyper_parameters"]["renderer"].__class__.__name__ == "GSplatDistributedAppearanceMipRenderer":
+    print("Replace renderer with `GSplatAppearanceEmbeddingMipRenderer`")
+
+    from internal.renderers.gsplat_appearance_embedding_renderer import GSplatAppearanceEmbeddingMipRenderer
+
+    renderer = GSplatAppearanceEmbeddingMipRenderer(
+        model=ckpt["hyper_parameters"]["renderer"].appearance,
+        optimization=ckpt["hyper_parameters"]["renderer"].appearance_optimization,
+        filter_2d_kernel_size=ckpt["hyper_parameters"]["renderer"].filter_2d_kernel_size,
+        tile_based_culling=getattr(ckpt["hyper_parameters"]["renderer"], "tile_based_culling", False),
+    )
+    ckpt["hyper_parameters"]["renderer"] = renderer
+
+    rename_ddp_appearance_states()
+
 
 print("number_of_gaussians=sum({})={}".format(number_of_gaussians, sum(number_of_gaussians)))
 output_path = os.path.join(checkpoint_dir, checkpoint_files[0][:checkpoint_files[0].rfind("-")] + ".ckpt")

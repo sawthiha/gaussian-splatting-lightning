@@ -4,7 +4,7 @@ from typing import Tuple, Optional, Union, List, Any
 import lightning
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
-from gsplat.sh import spherical_harmonics
+from gsplat.sh_decomposed import spherical_harmonics_decomposed
 from internal.cameras import Camera
 from . import Renderer
 from .gsplat_distributed_renderer import GSplatDistributedRenderer, GSplatDistributedRendererImpl
@@ -66,15 +66,19 @@ class GSplatDistributedAppearanceEmbeddingRendererImpl(GSplatDistributedRenderer
         return [embedding_optimizer, network_optimizer], [embedding_scheduler, network_scheduler]
 
     def get_rgbs(self, pc, camera: Camera, projection_results) -> torch.Tensor:
-        radii = projection_results[2]
-        is_gaussian_visible = radii > 0
+        is_gaussian_visible = projection_results[-1]
 
         detached_xyz = pc.get_xyz.detach()
         view_directions = detached_xyz[is_gaussian_visible] - camera.camera_center  # (N, 3)
-        view_directions = view_directions / view_directions.norm(dim=-1, keepdim=True)
-        base_rgb = spherical_harmonics(pc.active_sh_degree, view_directions, pc.get_features[is_gaussian_visible]) + 0.5
+        view_directions = torch.nn.functional.normalize(view_directions, dim=-1)
+        base_rgb = spherical_harmonics_decomposed(
+            pc.active_sh_degree,
+            view_directions,
+            dc=pc.get_shs_dc()[is_gaussian_visible],
+            coeffs=pc.get_shs_rest()[is_gaussian_visible],
+        ) + 0.5
         rgb_offset = self.appearance_model(pc.get_appearance_features()[is_gaussian_visible], camera.appearance_id, view_directions) * 2 - 1.
-        rgbs = torch.zeros((radii.shape[0], 3), dtype=projection_results[0].dtype, device=radii.device)
+        rgbs = torch.zeros((is_gaussian_visible.shape[0], 3), dtype=projection_results[1].dtype, device=is_gaussian_visible.device)
         rgbs[is_gaussian_visible] = torch.clamp(base_rgb + rgb_offset, min=0., max=1.)
 
         return rgbs
@@ -90,3 +94,19 @@ class GSplatDistributedAppearanceEmbeddingRenderer(GSplatDistributedRenderer):
         # TODO: enable warm up
         assert self.appearance_optimization.warm_up == 0, "`warm_up` must be `0` currently"
         return GSplatDistributedAppearanceEmbeddingRendererImpl(self)
+
+
+# With Mip
+@dataclass
+class GSplatDistributedAppearanceMipRenderer(GSplatDistributedAppearanceEmbeddingRenderer):
+    filter_2d_kernel_size: float = 0.1
+
+    def instantiate(self, *args, **kwargs) -> "GSplatDistributedAppearanceMipRendererModule":
+        assert self.appearance_optimization.warm_up == 0, "`warm_up` must be `0` currently"
+        return GSplatDistributedAppearanceMipRendererModule(self)
+
+
+class GSplatDistributedAppearanceMipRendererModule(GSplatDistributedAppearanceEmbeddingRendererImpl):
+    def get_scales_and_opacities(self, pc):
+        opacities, scales = pc.get_3d_filtered_scales_and_opacities()
+        return scales, opacities
