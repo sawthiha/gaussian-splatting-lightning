@@ -11,3 +11,4 @@ gaussian_splatting_lightning.egg-info
 **/mcmc_relocation.egg-info
 **/build
 sam_vit_h_4b8939.pth
+**/stable-diffusion-2-1
