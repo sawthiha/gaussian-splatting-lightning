@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Union, Tuple, Any
+from typing import Union, Tuple, Literal, Any
 import math
 import torch
 from .renderer import RendererConfig, Renderer, RendererOutputInfo, RendererOutputTypes
@@ -11,20 +11,12 @@ from gsplat.cuda._wrapper import (
     spherical_harmonics,
 )
 
-try:
-    from gsplat.sh_decomposed import spherical_harmonics_decomposed
-    from gsplat.cuda.isect_tiles_tile_based_culling import (
-        isect_tiles_tile_based_culling,
-        isect_offset_encode_tile_based_culling,
-    )
-except:
-    print("[ERROR] Incompatible gsplat found")
-    print("Please install the latest version:")
-    print("  pip uninstall gsplat")
-    print("  pip install git+https://github.com/yzslab/gsplat.git@v1-with_v0_interfaces")
-    exit()
-
-from gsplat import rasterize_to_pixels
+from gsplat.sh_decomposed import spherical_harmonics_decomposed
+from gsplat.cuda.isect_tiles_tile_based_culling import (
+    isect_tiles_tile_based_culling,
+    isect_offset_encode_tile_based_culling,
+)
+from gsplat.v0_interfaces import rasterize_to_pixels
 
 
 @dataclass
@@ -41,8 +33,20 @@ class GSplatV1Renderer(RendererConfig):
     tile_based_culling: bool = False
     """Tile-based culling, from StopThePop [Radl et al. 2024]"""
 
+    max_viewspace_grad_scale: float = 65535.
+    """ 1600 is recommended """
+
     def instantiate(self, *args, **kwargs) -> "GSplatV1RendererModule":
         return GSplatV1RendererModule(self)
+
+
+@dataclass
+class RuntimeOptions:
+    radius_clip: float = 0.
+
+    # radius_clip_from: float = 0.
+
+    camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
 
 class GSplatV1RendererModule(Renderer):
@@ -55,6 +59,7 @@ class GSplatV1RendererModule(Renderer):
     _INVERSE_DEPTH_REQUIRED = 1 << 6
     _HARD_DEPTH_REQUIRED = 1 << 7
     _HARD_INVERSE_DEPTH_REQUIRED = 1 << 8
+    _DEPTH_ALTERNATIVE = 1 << 9
 
     RENDER_TYPE_BITS = {
         "rgb": _RGB_REQUIRED,
@@ -66,15 +71,23 @@ class GSplatV1RendererModule(Renderer):
         "inverse_depth": _INVERSE_DEPTH_REQUIRED,
         "hard_depth": _HARD_DEPTH_REQUIRED,
         "hard_inverse_depth": _HARD_INVERSE_DEPTH_REQUIRED,
+        "inv_depth_alt": _DEPTH_ALTERNATIVE,
     }
 
     def __init__(self, config: GSplatV1Renderer):
         super().__init__()
         self.config = config
+        self.runtime_options = RuntimeOptions()
 
         self.isect_encode = GSplatV1.isect_encode_with_unused_opacities
         if self.config.tile_based_culling:
             self.isect_encode = GSplatV1.isect_encode_tile_based_culling
+
+        self._inv_depth_alt_state = 0
+        self._inv_depth_alt = [
+            self.RENDER_TYPE_BITS["inverse_depth"],
+            self.RENDER_TYPE_BITS["hard_inverse_depth"],
+        ]
 
     def parse_render_types(self, render_types: list) -> int:
         if render_types is None:
@@ -83,6 +96,11 @@ class GSplatV1RendererModule(Renderer):
             bits = 0
             for i in render_types:
                 bits |= self.RENDER_TYPE_BITS[i]
+
+            if self.is_type_required(bits, self._DEPTH_ALTERNATIVE):
+                bits |= self._inv_depth_alt[self._inv_depth_alt_state]
+                self._inv_depth_alt_state = int(not self._inv_depth_alt_state)
+
             return bits
 
     @staticmethod
@@ -121,18 +139,18 @@ class GSplatV1RendererModule(Renderer):
         if scaling_modifier != 1.:
             scales = scales * scaling_modifier
 
-        radii, means2d, depths, conics, compensations = GSplatV1.project(
+        projections = GSplatV1.project(
             preprocessed_camera,
             pc.get_means(),
             scales,
             pc.get_rotations(),
             eps2d=self.config.filter_2d_kernel_size,
             anti_aliased=self.config.anti_aliased,
+            radius_clip=self.runtime_options.radius_clip,
+            # radius_clip_from=self.runtime_options.radius_clip_from,
+            camera_model=self.runtime_options.camera_model,
         )
-
-        # key to `retain_grad` working properly
-        means2d = means2d.squeeze(0)
-        projections = radii, means2d.unsqueeze(0), depths, conics, compensations
+        radii, means2d, depths, conics, compensations = projections
 
         radii_squeezed = radii.squeeze(0)
         visibility_filter = radii_squeezed > 0
@@ -159,10 +177,13 @@ class GSplatV1RendererModule(Renderer):
         )
 
         # 3. rasterization
+        means2d = means2d.squeeze(0)
+        projection_for_rasterization = radii, means2d, depths, conics, compensations
+
         def rasterize(input_features: torch.Tensor, background, return_alpha: bool = False):
             rendered_colors, rendered_alphas = GSplatV1.rasterize(
                 preprocessed_camera,
-                projections,
+                projection_for_rasterization,
                 isects,
                 opacities=opacities,
                 colors=input_features,
@@ -176,6 +197,7 @@ class GSplatV1RendererModule(Renderer):
 
         # rgb
         rgb = None
+        acc_vis = None
         if self.is_type_required(render_type_bits, self._RGB_REQUIRED):
             rgbs = self.get_rgbs(
                 viewpoint_camera,
@@ -186,12 +208,15 @@ class GSplatV1RendererModule(Renderer):
                 **kwargs,
             )
             rgb = rasterize(rgbs, bg_color).permute(2, 0, 1)
+            # avoid overriding by hard depth
+            acc_vis = means2d.has_hit_any_pixels
 
         alpha = None
         acc_depth_im = None
         acc_depth_inverted_im = None
         exp_depth_im = None
         exp_depth_inverted_im = None
+        inv_depth_alt = None
         if self.is_type_required(render_type_bits, self._ACC_DEPTH_REQUIRED):
             # acc depth
             acc_depth_im, alpha = rasterize(depths[0].unsqueeze(-1), torch.zeros((1,), device=bg_color.device), True)
@@ -226,13 +251,14 @@ class GSplatV1RendererModule(Renderer):
         if self.is_type_required(render_type_bits, self._INVERSE_DEPTH_REQUIRED):
             inverse_depth = 1. / (depths[0].clamp_min(0.) + 1e-8).unsqueeze(-1)
             inverse_depth_im = rasterize(inverse_depth, torch.zeros((1,), dtype=torch.float, device=bg_color.device)).permute(2, 0, 1)
+            inv_depth_alt = inverse_depth_im
 
         # hard depth
         hard_depth_im = None
         if self.is_type_required(render_type_bits, self._HARD_DEPTH_REQUIRED):
             hard_depth_im, _ = GSplatV1.rasterize(
                 preprocessed_camera,
-                projections,
+                projection_for_rasterization,
                 isects,
                 opacities=opacities + (1 - opacities.detach()),
                 colors=depths[0].unsqueeze(-1),
@@ -247,7 +273,7 @@ class GSplatV1RendererModule(Renderer):
             inverse_depth = 1. / (depths[0].clamp_min(0.) + 1e-8).unsqueeze(-1)
             hard_inverse_depth_im, _ = GSplatV1.rasterize(
                 preprocessed_camera,
-                projections,
+                projection_for_rasterization,
                 isects,
                 opacities=opacities + (1 - opacities.detach()),
                 colors=inverse_depth,
@@ -256,6 +282,7 @@ class GSplatV1RendererModule(Renderer):
             )
 
             hard_inverse_depth_im = hard_inverse_depth_im.permute(2, 0, 1)
+            inv_depth_alt = hard_inverse_depth_im
 
         return {
             "render": rgb,
@@ -267,11 +294,21 @@ class GSplatV1RendererModule(Renderer):
             "inverse_depth": inverse_depth_im,
             "hard_depth": hard_depth_im,
             "hard_inverse_depth": hard_inverse_depth_im,
+            "inv_depth_alt": inv_depth_alt,
             "viewspace_points": means2d,
-            "viewspace_points_grad_scale": 0.5 * torch.tensor([preprocessed_camera[-1]]).to(means2d),
+            "viewspace_points_grad_scale": 0.5 * torch.tensor([preprocessed_camera[-1]]).to(means2d).clamp_(max=self.config.max_viewspace_grad_scale),
             "visibility_filter": visibility_filter,
+            "acc_vis": acc_vis,
             "radii": radii_squeezed,
+            "scales": scales,
+            "opacities": opacities[0],
+            "projections": projections,
+            "isects": isects,
         }
+
+    def setup_web_viewer_tabs(self, viewer, server, tabs):
+        with tabs.add_tab("gsplat"):
+            self._viewer_options = GSplatV1ViewerOptions(viewer, server, self.runtime_options)
 
     def get_available_outputs(self):
         return {
@@ -481,13 +518,15 @@ class GSplatV1:
                 tile_size=tile_size,
             )
 
-        return projections, isects, opacities
+        radii, means2d, depths, conics, compensations = projections
+
+        return (radii, means2d.squeeze(0), depths, conics, compensations), isects, opacities
 
     @classmethod
     def rasterize(
         cls,
         preprocessed_camera: Tuple,
-        projections,
+        projections,  # NOTE: the means2D must be [N, 2]
         isects,
         opacities: torch.Tensor,  # [1, N]
         colors: torch.Tensor,  # [N, n_color_dims]
@@ -528,3 +567,53 @@ class GSplatV1:
         K[0, 2] = cx
         K[1, 2] = cy
         return K
+
+
+from viser import ViserServer
+
+
+class GSplatV1ViewerOptions:
+    def __init__(self, viewer, server: ViserServer, options: RuntimeOptions):
+        self.viewer = viewer
+        self.server = server
+        self.options = options
+
+        # radius clip
+        self.radius_clip_number = server.gui.add_number(
+            label="Radius Clip",
+            initial_value=options.radius_clip,
+            step=0.1,
+            min=0.,
+            max=65535.,
+        )
+
+        @self.radius_clip_number.on_update
+        def _(_):
+            options.radius_clip = self.radius_clip_number.value
+            viewer.rerender_for_all_client()
+
+        # # radius clip from
+        # self.radius_clip_from_number = server.gui.add_number(
+        #     label="Radius Clip From",
+        #     initial_value=options.radius_clip_from,
+        #     step=0.01,
+        #     min=0.,
+        #     max=65535.,
+        # )
+
+        # @self.radius_clip_from_number.on_update
+        # def _(_):
+        #     options.radius_clip_from = self.radius_clip_from_number.value
+        #     viewer.rerender_for_all_client()
+
+        # camera model
+        self.camera_model_dropdown = server.gui.add_dropdown(
+            label="Camera Model",
+            options=["pinhole", "ortho", "fisheye"],
+            initial_value=options.camera_model,
+        )
+
+        @self.camera_model_dropdown.on_update
+        def _(_):
+            options.camera_model = self.camera_model_dropdown.value
+            viewer.rerender_for_all_client()
